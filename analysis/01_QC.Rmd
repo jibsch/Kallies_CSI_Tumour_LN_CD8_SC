@@ -1,0 +1,120 @@
+---
+title: "01_QC"
+author: "jibsch"
+date: "2023-07-17"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: inline
+---
+
+
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+```{r}
+data = Read10X("../data/sample_filtered_feature_bc_matrix/")
+
+seu = CreateSeuratObject(data$`Gene Expression`)
+seu[["ADT"]] = CreateAssayObject(data$`Antibody Capture`)
+```
+
+```{r}
+vdj = read.csv("../data/VDJ/filtered_contig_annotations.csv")
+vdj %>% group_by(barcode) %>% count(chain) %>% pivot_wider(names_from = "chain", values_from = "n") %>%
+  mutate(filter = TRB>1) -> filt
+
+vdj %>% group_by(barcode, chain) %>% arrange(-umis) %>% 
+  summarise(VDJ = paste(v_gene[1],j_gene[1], c_gene[1], sep = "_"), 
+            cdr3 = cdr3[1], cdr3_nt = cdr3_nt[1]) %>%
+  pivot_wider(names_from = "chain", values_from = c("VDJ", "cdr3", "cdr3_nt")) -> tcr
+
+seu@meta.data %>% as_tibble(rownames = "barcode") %>%
+  left_join(tcr, by = "barcode") -> x
+
+seu@meta.data = cbind(seu@meta.data, x[,7:12])
+
+seu = seu[, !row.names(seu@meta.data) %in% filt$barcode[!is.na(filt$barcode) & filt$filter] ]
+```
+
+
+
+```{r}
+seu$percent.mt = PercentageFeatureSet(seu, pattern = "^mt-")
+
+VlnPlot(seu, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"))
+```
+```{r}
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(nFeature_RNA, ..density..)) +
+  geom_density()+ 
+  geom_vline(xintercept = 1000)
+```
+```{r}
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(nCount_RNA, ..density..)) +
+  geom_density()+ 
+  geom_vline(xintercept = 15000)
+```
+```{r}
+seu@meta.data %>% as_tibble() %>%
+  ggplot(aes(percent.mt, ..density..)) +
+  geom_density()+ 
+  geom_vline(xintercept = 3)
+```
+
+```{r}
+summary(seu$nFeature_RNA > 1000 & seu$nCount_RNA < 15000 & seu$percent.mt < 3)
+```
+
+```{r}
+seu = seu[, seu$nFeature_RNA > 1000 & seu$nCount_RNA < 15000 & seu$percent.mt < 3]
+
+seu = SCTransform(seu)
+
+vargenes = seu@assays$SCT@var.features
+vargenes = vargenes[!grepl("Tr[ab]", vargenes)]
+
+seu = RunPCA(seu, verbose = F, features = vargenes)
+seu = RunUMAP(seu, dims = 1:25)
+
+DimPlot(seu)
+```
+```{r}
+seu = NormalizeData(seu, assay = "ADT", method = "CLR")
+
+RidgePlot(seu, features = row.names(seu@assays$ADT))
+
+seu@assays$ADT = subset(seu@assays$ADT, features = c("tum-notreat-id3", "tum-notreat" ,"tum-block-id3"  , "tum-block"))
+
+seu = HTODemux(seu, assay = "ADT")
+
+DimPlot(seu, group.by = "ADT_classification", label = T)
+table(seu$ADT_classification.global)
+
+```
+```{r}
+seu = FindNeighbors(seu, dims = 1:25)
+seu = FindClusters(seu)
+
+seu = seu[,seu$ADT_classification.global != "Doublet"]
+
+DimPlot(seu, label = T, split.by = "ADT_classification")
+```
+```{r}
+m = FindAllMarkers(seu, only.pos = F)
+write.csv(m, file = "../output/markers_global.csv", quote = F)
+```
+
+
+## Shiny App
+```{r}
+library(ShinyCell)
+
+scConf = createConfig(seu)
+
+makeShinyApp(seu, scConf, gene.mapping = TRUE, gex.assay = "SCT",
+             shiny.title = "Mouse Tumour and LN CD8T cells", shiny.dir = "Kallies_Lisa_Tumour_LN") 
+```
+
